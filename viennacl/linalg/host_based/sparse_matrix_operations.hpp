@@ -330,6 +330,9 @@ void prod_impl(viennacl::compressed_matrix<NumericT, AlignmentV> const & A,
    */
   std::vector<unsigned int> nnz_per_row_in_C(A.size1() + 1);
 
+#ifdef VIENNACL_WITH_OPENMP
+  #pragma omp parallel for
+#endif
   for (std::size_t i=0; i<A.size1(); ++i)
   {
     std::size_t row_start_A = A_row_buffer[i];
@@ -400,6 +403,9 @@ void prod_impl(viennacl::compressed_matrix<NumericT, AlignmentV> const & A,
   unsigned int * C_row_buffer = detail::extract_raw_pointer<unsigned int>(C.handle1());
   unsigned int * C_col_buffer = detail::extract_raw_pointer<unsigned int>(C.handle2());
 
+#ifdef VIENNACL_WITH_OPENMP
+  #pragma omp parallel for
+#endif
   for (std::size_t i=0; i<A.size1(); ++i)
   {
     unsigned int C_element_index = nnz_per_row_in_C[i];
