@@ -218,6 +218,8 @@ void prod_impl(viennacl::compressed_matrix<NumericT, AlignmentV> const & A,
   viennacl::vector<unsigned int> upper_bound_nonzeros_per_row_C(128, ctx); // upper bound for the nonzeros per row encountered for each work group
 
   viennacl::ocl::kernel & k1 = ctx.get_kernel(viennacl::linalg::opencl::kernels::compressed_matrix<NumericT>::program_name(), "spgemm_stage1");
+  k1.local_work_size(0, 128);
+  k1.global_work_size(0, 128*128);
   viennacl::ocl::enqueue(k1(A.handle1().opencl_handle(), A.handle2().opencl_handle(), cl_uint(A.size1()),
                             B.handle1().opencl_handle(), B.handle2().opencl_handle(), cl_uint(B.size1()),
                             viennacl::traits::opencl_handle(upper_bound_nonzeros_per_row_C)
@@ -239,6 +241,8 @@ void prod_impl(viennacl::compressed_matrix<NumericT, AlignmentV> const & A,
   C.resize(A.size1(), B.size2(), false);
 
   viennacl::ocl::kernel & k2 = ctx.get_kernel(viennacl::linalg::opencl::kernels::compressed_matrix<NumericT>::program_name(), "spgemm_stage2");
+  k2.local_work_size(0, 128);
+  k2.global_work_size(0, 128*128);
   viennacl::vector<unsigned int> scratchpad_memory(2 * k2.local_work_size(0) * max_nnz_per_row_C, ctx);
   viennacl::ocl::enqueue(k2(A.handle1().opencl_handle(), A.handle2().opencl_handle(), cl_uint(A.size1()),
                             B.handle1().opencl_handle(), B.handle2().opencl_handle(), cl_uint(B.size2()),
@@ -268,6 +272,8 @@ void prod_impl(viennacl::compressed_matrix<NumericT, AlignmentV> const & A,
   C.reserve(current_offset);
 
   viennacl::ocl::kernel & k3 = ctx.get_kernel(viennacl::linalg::opencl::kernels::compressed_matrix<NumericT>::program_name(), "spgemm_stage3");
+  k3.local_work_size(0, 128);
+  k3.global_work_size(0, 128*128);
   viennacl::vector<NumericT> scratchpad_memory2(2 * k3.local_work_size(0) * max_nnz_per_row_C, ctx);  // temporary rows and such
   viennacl::ocl::enqueue(k3(A.handle1().opencl_handle(), A.handle2().opencl_handle(), A.handle().opencl_handle(), cl_uint(A.size1()),
                             B.handle1().opencl_handle(), B.handle2().opencl_handle(), B.handle().opencl_handle(), cl_uint(B.size2()),
@@ -601,17 +607,82 @@ void smooth_jacobi(unsigned int iterations,
   }
 }
 
-
-
-/** @brief Computes B = trans(A).
-  *
-  * To be replaced by native functionality in ViennaCL.
-  */
 template<typename NumericT>
-void amg_transpose(compressed_matrix<NumericT> const & A,
-                   compressed_matrix<NumericT> & B)
+std::size_t amg_agg(compressed_matrix<NumericT> const & A,
+                    viennacl::vector<unsigned int> & coarse_agg_ids,
+                    viennacl::vector<char> & point_type)
 {
-  // headache
+  viennacl::context host_ctx(viennacl::MAIN_MEMORY);
+  viennacl::ocl::context & ctx = const_cast<viennacl::ocl::context &>(viennacl::traits::opencl_handle(A).context());
+  viennacl::linalg::opencl::kernels::compressed_matrix<NumericT>::init(ctx);
+
+  //
+  // Stage 1: Enumerate coarse points (use host)
+  //
+  coarse_agg_ids.switch_memory_context(host_ctx);
+  point_type.switch_memory_context(host_ctx);
+
+  unsigned int       * coarse_agg_ids_elements = viennacl::linalg::host_based::detail::extract_raw_pointer<unsigned int>(coarse_agg_ids.handle());
+  char         const * point_type_elements     = viennacl::linalg::host_based::detail::extract_raw_pointer<char>(point_type.handle());
+
+  std::size_t num_coarse = 0;
+  for (std::size_t i=0; i<A.size1(); ++i)
+  {
+    if (point_type_elements[i] == 1)
+    {
+      coarse_agg_ids_elements[i] = num_coarse;
+      ++num_coarse;
+    }
+    else
+      coarse_agg_ids_elements[i] = A.size1();
+  }
+
+  coarse_agg_ids.switch_memory_context(viennacl::traits::context(A));
+  point_type.switch_memory_context(viennacl::traits::context(A));
+
+  //
+  // Stage 2: Propagate coarse aggregate indices to neighbors:
+  //
+  viennacl::ocl::kernel & k2 = ctx.get_kernel(viennacl::linalg::opencl::kernels::compressed_matrix<NumericT>::program_name(), "amg_agg_2");
+
+  viennacl::ocl::enqueue(k2(A.handle1().opencl_handle(), A.handle2().opencl_handle(), A.handle().opencl_handle(),
+                            static_cast<cl_uint>(A.size1()),
+                            viennacl::traits::opencl_handle(coarse_agg_ids),
+                            viennacl::traits::opencl_handle(point_type)
+                         ) );
+
+  //
+  // Stage 3: Merge remaining undecided points (merging to first aggregate found when cycling over the hierarchy
+  //
+  viennacl::ocl::kernel & k3 = ctx.get_kernel(viennacl::linalg::opencl::kernels::compressed_matrix<NumericT>::program_name(), "amg_agg_3");
+
+  viennacl::ocl::enqueue(k3(A.handle1().opencl_handle(), A.handle2().opencl_handle(), A.handle().opencl_handle(),
+                            static_cast<cl_uint>(A.size1()),
+                            viennacl::traits::opencl_handle(coarse_agg_ids)
+                         ) );
+
+  return num_coarse;
+}
+
+
+template<typename NumericT>
+void amg_agg_interpol(compressed_matrix<NumericT> const & A,
+                      compressed_matrix<NumericT> & P,
+                      std::size_t num_coarse,
+                      viennacl::vector<unsigned int> const & coarse_agg_ids)
+{
+  viennacl::ocl::context & ctx = const_cast<viennacl::ocl::context &>(viennacl::traits::opencl_handle(A).context());
+  viennacl::linalg::opencl::kernels::compressed_matrix<NumericT>::init(ctx);
+  viennacl::ocl::kernel & k = ctx.get_kernel(viennacl::linalg::opencl::kernels::compressed_matrix<NumericT>::program_name(), "amg_agg_interpol");
+
+  P = compressed_matrix<NumericT>(A.size1(), num_coarse, A.size1(), viennacl::traits::context(A));
+
+  viennacl::ocl::enqueue(k(P.handle1().opencl_handle(), P.handle2().opencl_handle(), P.handle().opencl_handle(),
+                           static_cast<cl_uint>(P.size1()),
+                           viennacl::traits::opencl_handle(coarse_agg_ids)
+                         ));
+
+  P.generate_row_block_information();
 }
 
 
